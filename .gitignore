@@ -1,0 +1,7 @@
+.env
+__pycache__
+.vscode
+.venv
+.pytest_cache
+biometric-link-v1-spec.md
+TESTING.md

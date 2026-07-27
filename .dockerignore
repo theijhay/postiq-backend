@@ -1,49 +1,48 @@
-# Git                                                                                                                                                             
- .git                                                                                                                                                              
- .gitignore                                                                                                                                                        
- .github                                                                                                                                                           
-                                                                                                                                                                   
- # Docker                                                                                                                                                          
- Dockerfile                                                                                                                                                        
- .dockerignore                                                                                                                                                     
-                                                                                                                                                                   
- # Python                                                                                                                                                          
- __pycache__/                                                                                                                                                      
- *.py[cod]                                                                                                                                                         
- *$py.class                                                                                                                                                        
- *.so                                                                                                                                                              
- .Python                                                                                                                                                           
- env/                                                                                                                                                              
- build/                                                                                                                                                            
- develop-eggs/                                                                                                                                                     
- dist/                                                                                                                                                             
- downloads/                                                                                                                                                        
- eggs/                                                                                                                                                             
- .eggs/                                                                                                                                                            
- lib/                                                                                                                                                              
- lib64/                                                                                                                                                            
- parts/                                                                                                                                                            
- sdist/                                                                                                                                                            
- var/                                                                                                                                                              
- *.egg-info/                                                                                                                                                       
- .installed.cfg                                                                                                                                                    
- *.egg                                                                                                                                                             
-                                                                                                                                                                   
- # Virtual Environment                                                                                                                                             
- venv/                                                                                                                                                             
- ENV/                                                                                                                                                              
-                                                                                                                                                                   
- # IDE                                                                                                                                                             
- .idea/                                                                                                                                                            
- .vscode/                                                                                                                                                          
- *.swp                                                                                                                                                             
- *.swo                                                                                                                                                             
-                                                                                                                                                                   
- # Tests                                                                                                                                                           
- tests/                                                                                                                                                            
- .pytest_cache/                                                                                                                                                    
- .coverage                                                                                                                                                         
- htmlcov/                                                                                                                                                          
-                                                                                                                                                                   
- # Misc
- .DS_Store
+# Git
+.git
+.gitignore
+.github
+
+# Docker
+Dockerfile
+.dockerignore
+compose.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Misc
+.DS_Store
+Thumbs.db

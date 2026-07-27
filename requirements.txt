@@ -13,9 +13,9 @@ httpx
 python-multipart==0.0.9
 redis==5.2.1
 aio-pika==9.5.5
+apscheduler
+bcrypt
 cryptography
-numpy
-opencv-python-headless
 pytest
 pytest-asyncio
 email-validator

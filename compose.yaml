@@ -1,0 +1,85 @@
+name: postiq
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postiq
+      POSTGRES_PASSWORD: postiq
+      POSTGRES_DB: postiq
+    ports:
+      # Host ports are offset by 1 so this stack coexists with any Postgres/Redis
+      # already running locally. In-network services still use the standard ports.
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postiq -d postiq"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"  # management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      # Override the localhost defaults in .env with in-network service names.
+      DB_URL: postgresql://postiq:postiq@postgres:5432/postiq
+      REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # Ingestion worker — not built yet (Phase 1 ingestion). Behind a profile so it
+  # stays out of the default `docker compose up`. Enable with:
+  #   docker compose --profile workers up
+  worker:
+    profiles: ["workers"]
+    build: .
+    env_file: .env
+    environment:
+      DB_URL: postgresql://postiq:postiq@postgres:5432/postiq
+      REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    # Migrations are owned by the api service; the worker only consumes.
+    command: ["python", "-m", "workers.ingestion_consumer"]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:

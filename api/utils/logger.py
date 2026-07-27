@@ -1,6 +1,6 @@
 import logging
 
-logger = logging.getLogger("biometriclink")
+logger = logging.getLogger("postiq")
 logger.setLevel(logging.INFO)
 logger.propagate = False  # own handler below; don't duplicate via the root logger
 handler = logging.StreamHandler()

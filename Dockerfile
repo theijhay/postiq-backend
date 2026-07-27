@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Expose port (used in both dev and prod)
-EXPOSE 8001
+EXPOSE 8000
 
-# Entrypoint command (development)
-CMD ["sh", "-c", "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8001"]
+# Entrypoint command (development). APP_PORT matches api/utils/settings.py.
+CMD ["sh", "-c", "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port ${APP_PORT:-8000}"]

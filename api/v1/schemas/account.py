@@ -18,6 +18,9 @@ class ConnectedAccountResponse(BaseModel):
     platform: str
     fb_page_id: Optional[str]
     ig_business_id: Optional[str]
+    # BUSINESS or MEDIA_CREATOR — both fully supported.
+    ig_account_type: Optional[str]
+    ig_username: Optional[str]
     account_name: Optional[str]
     status: str
     connected_at: datetime

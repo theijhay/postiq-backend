@@ -18,14 +18,22 @@ import httpx
 from api.utils.logger import logger
 from api.utils.settings import settings
 
-# Requested at OAuth time (PROJECT_SPEC.md §8, P0). Each of these needs Advanced
-# Access via App Review before it works on accounts the developer doesn't own.
-META_SCOPES = [
-    "pages_show_list",
-    "pages_read_engagement",
-    "instagram_basic",
-    "instagram_manage_insights",
-]
+def _scopes() -> list[str]:
+    """Scopes requested at OAuth time (PROJECT_SPEC.md §8, P0).
+
+    Read from settings on each call rather than frozen at import, so the set can
+    be narrowed via env while the Meta app dashboard is being configured. The
+    Instagram scopes only exist once the app has the Instagram product added —
+    until then Meta rejects the entire dialog with "Invalid Scopes".
+
+    Each of these also needs Advanced Access via App Review before it works on
+    accounts the developer does not own.
+    """
+    return [s.strip() for s in settings.META_SCOPES.split(",") if s.strip()]
+
+
+# Kept as a module attribute for callers that just want to display the list.
+META_SCOPES = _scopes()
 
 # Meta rate-limits aggressively and returns 5xx under load; retry those.
 _RETRY_STATUS = {429, 500, 502, 503, 504}
@@ -63,7 +71,7 @@ def build_authorization_url(state: str) -> str:
             "client_id": settings.META_APP_ID,
             "redirect_uri": settings.META_REDIRECT_URI,
             "state": state,
-            "scope": ",".join(META_SCOPES),
+            "scope": ",".join(_scopes()),
             "response_type": "code",
         }
     )
@@ -153,23 +161,165 @@ async def get_me(access_token: str) -> dict[str, Any]:
         )
 
 
+async def debug_token(access_token: str) -> dict[str, Any]:
+    """Inspect a token with the app token.
+
+    ``granular_scopes`` is the useful part: for Facebook Login for Business it
+    lists the exact asset ids each permission was granted against. If a Page id
+    appears there but ``/me/accounts`` is empty, the grant succeeded and the
+    problem is on the listing side, not the consent side — a distinction no
+    other endpoint makes visible.
+    """
+    app_token = f"{settings.META_APP_ID}|{settings.META_APP_SECRET}"
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        payload = await _request(
+            client,
+            "debug_token",
+            {"input_token": access_token, "access_token": app_token},
+        )
+    return payload.get("data", {})
+
+
+async def get_businesses(access_token: str) -> list[dict[str, Any]]:
+    """Business portfolios the user belongs to.
+
+    A Page owned by a Business portfolio can be invisible to ``/me/accounts``
+    when the app was not granted access to that portfolio.
+    """
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        payload = await _request(
+            client,
+            "me/businesses",
+            {
+                "fields": "id,name",
+                "access_token": access_token,
+                "appsecret_proof": appsecret_proof(access_token),
+            },
+        )
+    return payload.get("data", [])
+
+
+async def get_granted_permissions(access_token: str) -> dict[str, str]:
+    """What the user actually approved, as ``{permission: granted|declined}``.
+
+    The consent dialog lets people approve some scopes and decline others, and
+    Facebook Login for Business additionally asks them to *select which Pages*
+    to share. A user who clicks through without picking one grants
+    ``pages_show_list`` yet still returns an empty ``/me/accounts`` — which is
+    indistinguishable from "has no Page" unless we look here.
+    """
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        payload = await _request(
+            client,
+            "me/permissions",
+            {
+                "access_token": access_token,
+                "appsecret_proof": appsecret_proof(access_token),
+            },
+        )
+    return {
+        entry["permission"]: entry["status"]
+        for entry in payload.get("data", [])
+        if entry.get("permission")
+    }
+
+
+# Scopes whose granted assets are Pages.
+_PAGE_SCOPES = frozenset(
+    {
+        "pages_show_list",
+        "pages_read_engagement",
+        "pages_manage_metadata",
+        "pages_read_user_content",
+    }
+)
+
+
+def page_ids_from_granular_scopes(token_info: dict[str, Any]) -> list[str]:
+    """Extract granted Page ids from a debug_token payload, order preserved."""
+    ids: list[str] = []
+    for entry in token_info.get("granular_scopes") or []:
+        if entry.get("scope") in _PAGE_SCOPES:
+            for target in entry.get("target_ids") or []:
+                if target not in ids:
+                    ids.append(target)
+    return ids
+
+
+async def get_page(page_id: str, access_token: str) -> dict[str, Any]:
+    """Fetch one Page directly, including its own access token."""
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        return await _request(
+            client,
+            page_id,
+            {
+                "fields": "id,name,access_token",
+                "access_token": access_token,
+                "appsecret_proof": appsecret_proof(access_token),
+            },
+        )
+
+
 async def get_pages(access_token: str) -> list[dict[str, Any]]:
-    """Facebook Pages the user administers, each with its own Page token.
+    """Facebook Pages this token can act on, each with its own Page token.
 
     Page tokens are a distinct credential from the user token — Page-level
     insights calls must use these.
+
+    Two lookup strategies, because ``/me/accounts`` alone is not reliable:
+
+    1. ``/me/accounts`` — the conventional listing.
+    2. If that comes back empty, read the Page ids out of the token's
+       ``granular_scopes`` and fetch each Page directly.
+
+    Step 2 exists because Facebook Login for Business grants *specific assets*
+    chosen by the user, and those grants are recorded in ``granular_scopes``
+    while ``/me/accounts`` can still return nothing. Observed directly: a token
+    with ``pages_show_list`` granted against Page 1041775684… listed zero
+    accounts. Treating the listing as authoritative reports "you have no Page"
+    to someone who just picked one, which is both wrong and unfixable by them.
+
+    Only base fields are requested here. ``instagram_business_account`` is
+    resolved separately per Page, so a missing Instagram grant costs us the
+    Instagram link rather than the whole connect.
     """
     async with httpx.AsyncClient(timeout=20.0) as client:
         payload = await _request(
             client,
             "me/accounts",
             {
-                "fields": "id,name,access_token,instagram_business_account{id,username}",
+                "fields": "id,name,access_token",
                 "access_token": access_token,
                 "appsecret_proof": appsecret_proof(access_token),
             },
         )
-    return payload.get("data", [])
+
+    pages = payload.get("data", [])
+    if pages:
+        return pages
+
+    try:
+        granted_ids = page_ids_from_granular_scopes(await debug_token(access_token))
+    except MetaAPIError as exc:
+        logger.warning("Could not inspect token for granted Pages: %s", exc)
+        return []
+
+    if not granted_ids:
+        return []
+
+    logger.info(
+        "/me/accounts was empty; resolving %s Page(s) from granular_scopes",
+        len(granted_ids),
+    )
+
+    resolved: list[dict[str, Any]] = []
+    for page_id in granted_ids:
+        try:
+            resolved.append(await get_page(page_id, access_token))
+        except MetaAPIError as exc:
+            logger.warning("Granted Page %s could not be read: %s", page_id, exc)
+
+    return resolved
 
 
 async def get_instagram_business_account(
@@ -192,6 +342,110 @@ async def get_instagram_business_account(
             },
         )
     return payload.get("instagram_business_account")
+
+
+async def get_instagram_account(ig_user_id: str, access_token: str) -> dict[str, Any]:
+    """Profile fields for a linked IG Professional account.
+
+    ``account_type`` is either BUSINESS or MEDIA_CREATOR — both are supported;
+    we read it so ingestion can adapt its metric requests.
+    """
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        return await _request(
+            client,
+            ig_user_id,
+            {
+                "fields": "id,username,account_type,followers_count,media_count",
+                "access_token": access_token,
+                "appsecret_proof": appsecret_proof(access_token),
+            },
+        )
+
+
+# Fields that describe the post itself, as opposed to its performance.
+_MEDIA_FIELDS = (
+    "id,caption,media_type,media_product_type,permalink,media_url,"
+    "thumbnail_url,timestamp,like_count,comments_count"
+)
+
+
+async def get_instagram_media(
+    ig_user_id: str, access_token: str, limit: int = 50, after: str | None = None
+) -> dict[str, Any]:
+    """One page of the account's media, newest first.
+
+    Returns the raw envelope so the caller can follow ``paging.cursors.after``.
+    """
+    params: dict[str, Any] = {
+        "fields": _MEDIA_FIELDS,
+        "limit": limit,
+        "access_token": access_token,
+        "appsecret_proof": appsecret_proof(access_token),
+    }
+    if after:
+        params["after"] = after
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        return await _request(client, f"{ig_user_id}/media", params)
+
+
+# Insight metric names vary by what kind of media it is. Requesting a metric a
+# media type doesn't support makes Meta reject the WHOLE call, so these sets are
+# deliberately conservative rather than a union of everything available.
+#
+# `impressions` is absent on purpose: deprecated from v21 and folded into
+# `views`. See post_metrics_snapshot.py.
+_METRICS_BY_PRODUCT_TYPE: dict[str, tuple[str, ...]] = {
+    "REELS": ("reach", "likes", "comments", "shares", "saved", "views"),
+    "STORY": ("reach", "views"),
+    "FEED": ("reach", "likes", "comments", "shares", "saved", "views"),
+    "AD": ("reach",),
+}
+_DEFAULT_METRICS = ("reach", "likes", "comments", "shares", "saved", "views")
+
+
+def metrics_for(media_product_type: str | None) -> tuple[str, ...]:
+    """Pick the metric set for a media item. Public so tests can pin it."""
+    if not media_product_type:
+        return _DEFAULT_METRICS
+    return _METRICS_BY_PRODUCT_TYPE.get(media_product_type.upper(), _DEFAULT_METRICS)
+
+
+async def get_media_insights(
+    media_id: str, access_token: str, media_product_type: str | None = None
+) -> dict[str, int]:
+    """Flatten a media item's insights into ``{metric: value}``.
+
+    Returns an empty dict rather than raising when Meta refuses the whole call.
+    A single post whose metrics we cannot read must not abort a sync of two
+    hundred others — the post row is still worth storing, and the next run will
+    try again. Genuinely fatal problems (expired token) surface earlier, on the
+    media fetch.
+    """
+    metrics = metrics_for(media_product_type)
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            payload = await _request(
+                client,
+                f"{media_id}/insights",
+                {
+                    "metric": ",".join(metrics),
+                    "access_token": access_token,
+                    "appsecret_proof": appsecret_proof(access_token),
+                },
+            )
+    except MetaAPIError as exc:
+        logger.warning("Insights unavailable for media %s: %s", media_id, exc)
+        return {}
+
+    values: dict[str, int] = {}
+    for entry in payload.get("data", []):
+        name = entry.get("name")
+        series = entry.get("values") or []
+        if name and series and isinstance(series[0].get("value"), int):
+            values[name] = series[0]["value"]
+    return values
 
 
 def parse_signed_request(signed_request: str) -> dict[str, Any]:

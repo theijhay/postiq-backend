@@ -16,6 +16,7 @@ from api.utils.settings import settings
 from api.v1.services.meta_client import (
     MetaAPIError,
     build_authorization_url,
+    page_ids_from_granular_scopes,
     parse_signed_request,
 )
 
@@ -76,6 +77,12 @@ def test_malformed_input_raises_meta_error(value):
 def test_authorization_url_carries_state_and_scopes(monkeypatch):
     monkeypatch.setattr(settings, "META_APP_ID", "app-123")
     monkeypatch.setattr(settings, "META_REDIRECT_URI", "https://x.test/cb")
+    # Pin the scopes rather than inheriting whatever .env happens to hold —
+    # META_SCOPES is deliberately environment-tunable, so reading the real value
+    # here would make this test fail on a developer machine mid-configuration.
+    monkeypatch.setattr(
+        settings, "META_SCOPES", "pages_read_engagement,instagram_manage_insights"
+    )
 
     url = build_authorization_url("state-abc")
 
@@ -83,3 +90,71 @@ def test_authorization_url_carries_state_and_scopes(monkeypatch):
     assert "state=state-abc" in url
     assert "instagram_manage_insights" in url
     assert "pages_read_engagement" in url
+
+
+class TestPageIdsFromGranularScopes:
+    """Recovering granted Pages when /me/accounts returns nothing.
+
+    Shape below is a real debug_token response observed on 2026-07-28, where
+    the Page was granted but the listing endpoint reported none.
+    """
+
+    REAL_PAYLOAD = {
+        "type": "USER",
+        "app_id": "2051818322130149",
+        "granular_scopes": [
+            {"scope": "pages_show_list", "target_ids": ["104177568454287"]},
+            {"scope": "pages_read_engagement", "target_ids": ["104177568454287"]},
+        ],
+    }
+
+    def test_extracts_granted_page_id(self):
+        assert page_ids_from_granular_scopes(self.REAL_PAYLOAD) == ["104177568454287"]
+
+    def test_deduplicates_across_scopes(self):
+        """The same Page appears under every page scope; report it once."""
+        assert len(page_ids_from_granular_scopes(self.REAL_PAYLOAD)) == 1
+
+    def test_ignores_non_page_scopes(self):
+        payload = {
+            "granular_scopes": [
+                {"scope": "instagram_basic", "target_ids": ["ig-999"]},
+                {"scope": "pages_show_list", "target_ids": ["page-1"]},
+            ]
+        }
+        assert page_ids_from_granular_scopes(payload) == ["page-1"]
+
+    def test_preserves_order_across_multiple_pages(self):
+        payload = {
+            "granular_scopes": [
+                {"scope": "pages_show_list", "target_ids": ["p1", "p2"]},
+                {"scope": "pages_read_engagement", "target_ids": ["p2", "p3"]},
+            ]
+        }
+        assert page_ids_from_granular_scopes(payload) == ["p1", "p2", "p3"]
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {},
+            {"granular_scopes": []},
+            {"granular_scopes": None},
+            {"granular_scopes": [{"scope": "pages_show_list"}]},  # no target_ids
+            {"granular_scopes": [{"scope": "pages_show_list", "target_ids": None}]},
+        ],
+    )
+    def test_missing_or_malformed_data_yields_empty_list(self, payload):
+        assert page_ids_from_granular_scopes(payload) == []
+
+
+def test_authorization_url_reflects_configured_scopes(monkeypatch):
+    """Narrowing META_SCOPES must actually narrow the dialog request."""
+    monkeypatch.setattr(settings, "META_APP_ID", "app-123")
+    monkeypatch.setattr(settings, "META_SCOPES", "pages_show_list, pages_read_engagement")
+
+    url = build_authorization_url("state-abc")
+
+    assert "instagram_manage_insights" not in url
+    assert "pages_show_list" in url
+    # Whitespace around the comma must not leak into the request.
+    assert "+pages_read_engagement" not in url and "%20" not in url

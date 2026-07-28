@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     RABBITMQ_URL: str = "amqp://guest:guest@localhost:5672/"
     WEBHOOK_QUEUE_NAME: str = "postiq.webhooks"
     INGESTION_QUEUE_NAME: str = "postiq.ingestion"
+    # Metrics settle over 24-48h and Meta rate-limits ~200 calls/hour/user, so
+    # syncing harder than this gains nothing (PROJECT_SPEC.md §9.5).
+    INGESTION_INTERVAL_HOURS: int = 6
 
     # Meta Graph API
     META_APP_ID: str = ""
@@ -41,6 +44,13 @@ class Settings(BaseSettings):
     META_GRAPH_VERSION: str = "v22.0"
     META_GRAPH_BASE: str = "https://graph.facebook.com"
     META_POST_CONNECT_REDIRECT: str = "http://localhost:3000/accounts"
+    # Comma-separated. Overridable so the connect flow can be narrowed while
+    # the Meta app dashboard is still being configured — requesting a scope the
+    # app has no product for fails the whole dialog with "Invalid Scopes".
+    META_SCOPES: str = (
+        "pages_show_list,pages_read_engagement,"
+        "instagram_basic,instagram_manage_insights"
+    )
     # OAuth CSRF state lifetime in Redis
     META_OAUTH_STATE_TTL_SECONDS: int = 600
 

@@ -52,6 +52,49 @@ async def consume_oauth_state(state: str) -> uuid.UUID:
     return uuid.UUID(user_id)
 
 
+async def _diagnose_empty_pages(user_id: uuid.UUID, user_token: str) -> dict[str, str]:
+    """Log everything that distinguishes the causes of an empty /me/accounts.
+
+    Meta reports "no Pages" identically whether the user has none, declined the
+    grant, or granted a Page that the listing endpoint then omits. Each call
+    here is wrapped separately so one failing still leaves the others useful.
+    """
+    granted: dict[str, str] = {}
+
+    try:
+        granted = await meta_client.get_granted_permissions(user_token)
+    except Exception:  # noqa: BLE001
+        logger.warning("diagnose: could not read /me/permissions")
+
+    try:
+        info = await meta_client.debug_token(user_token)
+        # granular_scopes names the exact asset ids behind each permission.
+        logger.warning(
+            "diagnose: token type=%s app_id=%s granular_scopes=%s",
+            info.get("type"),
+            info.get("app_id"),
+            info.get("granular_scopes"),
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("diagnose: could not debug_token")
+
+    try:
+        businesses = await meta_client.get_businesses(user_token)
+        logger.warning(
+            "diagnose: businesses=%s",
+            [(b.get("id"), b.get("name")) for b in businesses] or "none",
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("diagnose: could not read /me/businesses")
+
+    logger.warning(
+        "Connect failed for user %s — /me/accounts empty. Granted: %s",
+        user_id,
+        granted or "unknown",
+    )
+    return granted
+
+
 async def complete_connection(
     db: AsyncSession, user_id: uuid.UUID, code: str
 ) -> ConnectedAccount:
@@ -72,16 +115,66 @@ async def complete_connection(
     pages = await meta_client.get_pages(user_token)
 
     if not pages:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                "No Facebook Page found on this account. PostIQ needs a Page with "
-                "a linked Instagram Business account."
-            ),
-        )
+        # An empty /me/accounts has two very different causes that look
+        # identical from here: the user has no Page at all, or they were not
+        # granted access to one. Ask Meta which, so the message can be useful
+        # and so the logs say what actually happened.
+        granted = await _diagnose_empty_pages(user_id, user_token)
 
-    page = next((p for p in pages if p.get("instagram_business_account")), pages[0])
-    ig_account = page.get("instagram_business_account") or {}
+        if granted.get("pages_show_list") != "granted":
+            detail = (
+                "PostIQ wasn't given access to any Facebook Page. Reconnect and, "
+                "on the Meta consent screen, make sure you select the Page you "
+                "want to analyse before continuing."
+            )
+        else:
+            detail = (
+                "No Facebook Page is available on this Meta account. PostIQ needs "
+                "a Page with an Instagram Professional account (Business or "
+                "Creator) linked to it. Create or get admin access to a Page, "
+                "link your Instagram account to it, then reconnect."
+            )
+
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
+    # Resolve the Instagram link per Page, tolerating failure. Prefer a Page
+    # that has one; fall back to the first Page so the account still connects
+    # and the user gets a clear "no Instagram linked" state rather than an error.
+    page = pages[0]
+    ig_account: dict = {}
+
+    for candidate in pages:
+        try:
+            linked = await meta_client.get_instagram_business_account(
+                candidate["id"], candidate.get("access_token") or user_token
+            )
+        except Exception:  # noqa: BLE001 - missing instagram_basic is expected here
+            logger.info(
+                "Could not read Instagram link for page %s (Instagram scopes may "
+                "not be granted yet)",
+                candidate.get("id"),
+            )
+            continue
+
+        if linked:
+            page, ig_account = candidate, linked
+            break
+
+    # The edge is named instagram_business_account for historical reasons, but
+    # it returns any linked Professional account. Read the real account_type so
+    # ingestion can adapt: Creator accounts are fully supported and are common
+    # among the people this product targets.
+    ig_profile: dict = {}
+    if ig_account.get("id"):
+        try:
+            ig_profile = await meta_client.get_instagram_account(
+                ig_account["id"], page.get("access_token") or user_token
+            )
+        except Exception:  # noqa: BLE001 - profile detail is not worth failing the connect over
+            logger.warning(
+                "Could not read IG profile for %s; continuing without account_type",
+                ig_account.get("id"),
+            )
 
     # Reconnecting the same Meta user should update the existing row rather than
     # accumulate duplicates.
@@ -101,7 +194,9 @@ async def complete_connection(
     account.platform = "meta"
     account.fb_page_id = page.get("id")
     account.ig_business_id = ig_account.get("id")
-    account.account_name = ig_account.get("username") or page.get("name")
+    account.ig_username = ig_profile.get("username") or ig_account.get("username")
+    account.ig_account_type = ig_profile.get("account_type")
+    account.account_name = account.ig_username or page.get("name")
     account.access_token_encrypted = encrypt_str(user_token)
     account.page_access_token_encrypted = (
         encrypt_str(page["access_token"]) if page.get("access_token") else None
@@ -117,7 +212,7 @@ async def complete_connection(
 
     if not account.ig_business_id:
         logger.warning(
-            "Page %s connected without a linked Instagram Business account — "
+            "Page %s connected without a linked Instagram Professional account — "
             "IG insights will be unavailable for account %s",
             account.fb_page_id,
             account.id,

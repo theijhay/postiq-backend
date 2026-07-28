@@ -22,6 +22,21 @@ class AccountStatus:
     DISCONNECTED = "disconnected"
 
 
+class IGAccountType:
+    """Instagram *Professional* account flavours.
+
+    Both are fully supported by the Graph API — only genuinely personal
+    accounts are excluded. Creator accounts are common among the people this
+    product targets, so nothing here may treat them as second-class. The value
+    matters because a few metrics differ between the two, so ingestion adapts
+    its metric requests rather than assuming Business.
+    """
+
+    BUSINESS = "BUSINESS"
+    CREATOR = "MEDIA_CREATOR"
+    PERSONAL = "PERSONAL"
+
+
 class ConnectedAccount(BaseTableModel):
     __tablename__ = "connected_accounts"
 
@@ -37,7 +52,11 @@ class ConnectedAccount(BaseTableModel):
         String(64), index=True, nullable=True
     )
     fb_page_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # Column name kept for continuity; holds any linked IG *Professional*
+    # account id, Business or Creator alike.
     ig_business_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    ig_account_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    ig_username: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     account_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     # Ciphertext from api.core.security.encrypt_str — never plaintext (§9.6).

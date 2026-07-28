@@ -1,16 +1,18 @@
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.core import mq
 from api.core.dependencies import get_current_user
 from api.db.database import get_db
+from api.utils.logger import logger
 from api.utils.success_response import success_response
-from api.v1.models.connected_account import ConnectedAccount
+from api.v1.models.connected_account import AccountStatus, ConnectedAccount
 from api.v1.models.user import User
 from api.v1.schemas.account import ConnectedAccountResponse
-from api.v1.services import meta_account_service
+from api.v1.services import meta_account_service, post_service
 
 accounts = APIRouter(prefix="/accounts", tags=["Accounts"])
 
@@ -70,4 +72,60 @@ async def disconnect_account(
     return success_response(
         status_code=status.HTTP_200_OK,
         message="Account disconnected and all associated data deleted.",
+    )
+
+
+@accounts.get("/{account_id}/posts")
+async def list_posts(
+    account_id: uuid.UUID,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Paginated posts with their latest metrics."""
+    await _owned_account(account_id, db, current_user)
+    result = await post_service.list_posts(db, account_id, page, page_size)
+
+    return success_response(
+        status_code=status.HTTP_200_OK,
+        message="Posts retrieved.",
+        data=result.model_dump(),
+    )
+
+
+@accounts.post("/{account_id}/sync", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_sync(
+    account_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Queue an immediate ingestion run for this account.
+
+    Returns 202 rather than waiting: a sync walks many Graph API pages and can
+    take minutes. The scheduler covers the routine case; this exists so a user
+    who just connected doesn't sit staring at an empty dashboard, and so the
+    flow is testable without waiting for the interval.
+    """
+    account = await _owned_account(account_id, db, current_user)
+
+    if account.status == AccountStatus.DISCONNECTED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This account is disconnected. Reconnect it before syncing.",
+        )
+
+    try:
+        await mq.publish_ingestion_job(str(account.id), reason="manual")
+    except Exception:
+        # The broker being down shouldn't read as "your account is broken".
+        logger.exception("Could not queue ingestion for account %s", account.id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Sync could not be queued right now. Please try again shortly.",
+        )
+
+    return success_response(
+        status_code=status.HTTP_202_ACCEPTED,
+        message="Sync queued. New data will appear within a few minutes.",
     )

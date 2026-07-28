@@ -11,7 +11,7 @@ from api.v1.routes import api_version_one
 from api.utils.settings import settings
 from api.utils.success_response import success_response
 from starlette.status import HTTP_200_OK
-from api.utils.logger import logger
+from api.utils.logger import logger, silence_noisy_loggers
 import logging
 
 
@@ -61,6 +61,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+
+# Must run after basicConfig, which would otherwise re-enable httpx at INFO and
+# write Graph API credentials (client_secret, access_token) into stdout.
+silence_noisy_loggers()
 
 
 # Sessions (for auth, email, etc.)

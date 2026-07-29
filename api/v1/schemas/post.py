@@ -22,6 +22,9 @@ class PostResponse(BaseModel):
 
     id: uuid.UUID
     platform_post_id: str
+    # instagram | facebook. Never pool the two when comparing performance —
+    # their reach mechanics differ enough that a combined average is meaningless.
+    source: str
     post_type: Optional[str]
     caption: Optional[str]
     posted_at: Optional[datetime]

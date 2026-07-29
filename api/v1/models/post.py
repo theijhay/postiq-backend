@@ -15,11 +15,29 @@ if TYPE_CHECKING:
     from api.v1.models.post_metrics_snapshot import PostMetricsSnapshot
 
 
+class PostSource:
+    """Which Meta surface a post came from.
+
+    An account can have both — a Facebook Page with a linked Instagram
+    Professional account produces two independent streams. Insights must be
+    computed per source and never pooled: organic Page reach and Instagram
+    reach are driven by different ranking systems, so an engagement rate
+    averaged across the two describes neither.
+    """
+
+    INSTAGRAM = "instagram"
+    FACEBOOK = "facebook"
+
+
 class PostType:
     IMAGE = "image"
     CAROUSEL = "carousel"
     VIDEO = "video"
     REEL = "reel"
+    # Facebook-only formats. Instagram has no equivalent of a link share or a
+    # text-only post, so these never appear on an instagram-sourced row.
+    LINK = "link"
+    TEXT = "text"
 
 
 class Post(BaseTableModel):
@@ -37,6 +55,12 @@ class Post(BaseTableModel):
         ForeignKey("connected_accounts.id", ondelete="CASCADE"),
     )
     platform_post_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # Not part of uq_post_account_platform_id: Meta ids are unique across
+    # surfaces (Facebook post ids are "{page_id}_{post_id}", Instagram media
+    # ids are bare numerics), so the pair already cannot collide.
+    source: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=PostSource.INSTAGRAM
+    )
     post_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     caption: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 

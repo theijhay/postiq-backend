@@ -47,9 +47,15 @@ class Settings(BaseSettings):
     # Comma-separated. Overridable so the connect flow can be narrowed while
     # the Meta app dashboard is still being configured — requesting a scope the
     # app has no product for fails the whole dialog with "Invalid Scopes".
+    # pages_read_user_content is what makes like and comment counts readable on
+    # a Page post — they are user-generated content, so pages_read_engagement
+    # alone is not enough. Without it the Page path still works, just without
+    # those two columns.
+    # read_insights is what makes the Page post insights edge return data at
+    # all; without it valid metrics come back with an empty series.
     META_SCOPES: str = (
-        "pages_show_list,pages_read_engagement,"
-        "instagram_basic,instagram_manage_insights"
+        "pages_show_list,pages_read_engagement,pages_read_user_content,"
+        "read_insights,instagram_basic,instagram_manage_insights"
     )
     # OAuth CSRF state lifetime in Redis
     META_OAUTH_STATE_TTL_SECONDS: int = 600

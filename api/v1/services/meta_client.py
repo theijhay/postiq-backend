@@ -44,9 +44,30 @@ _BASE_BACKOFF_SECONDS = 1.0
 class MetaAPIError(RuntimeError):
     """A Graph API call failed in a way we can't recover from."""
 
-    def __init__(self, message: str, status_code: int | None = None):
+    def __init__(
+        self, message: str, status_code: int | None = None, code: int | None = None
+    ):
         super().__init__(message)
         self.status_code = status_code
+        # Meta's own error code from body.error.code. The HTTP status is nearly
+        # always 400 regardless of cause, so this is the only field that tells
+        # a dead token apart from a missing permission.
+        self.code = code
+
+
+# Meta error codes that mean the token itself is no longer usable, as opposed
+# to the token being fine but lacking a permission. Both arrive as HTTP 400.
+_AUTH_ERROR_CODES = frozenset({102, 190})
+
+
+def is_auth_error(exc: MetaAPIError) -> bool:
+    """Whether an error means "reconnect", rather than "grant more scopes".
+
+    Getting this wrong is user-visible: marking an account token_expired for a
+    permission error tells someone to reconnect, which cannot fix it and leaves
+    them looping through the consent dialog.
+    """
+    return exc.status_code == 401 or exc.code in _AUTH_ERROR_CODES
 
 
 def _graph_url(path: str) -> str:
@@ -94,14 +115,17 @@ async def _request(
                 return response.json()
 
             # Meta puts the useful detail in body.error.message, not the status line.
+            error_code: int | None = None
             try:
-                detail = response.json().get("error", {}).get("message", response.text)
+                error = response.json().get("error", {})
+                detail = error.get("message", response.text)
+                error_code = error.get("code")
             except ValueError:
                 detail = response.text
             last_error = f"HTTP {response.status_code}: {detail}"
 
             if response.status_code not in _RETRY_STATUS:
-                raise MetaAPIError(last_error, response.status_code)
+                raise MetaAPIError(last_error, response.status_code, error_code)
 
         if attempt < _MAX_ATTEMPTS - 1:
             delay = _BASE_BACKOFF_SECONDS * (2**attempt)
@@ -445,6 +469,131 @@ async def get_media_insights(
         series = entry.get("values") or []
         if name and series and isinstance(series[0].get("value"), int):
             values[name] = series[0]["value"]
+    return values
+
+
+# Facebook Page posts, split by the permission each half needs.
+#
+# Everything in _PAGE_POST_BASE_FIELDS reads with `pages_read_engagement`
+# alone. `shares` belongs here despite being an engagement number — it has no
+# summary form, arriving as {"count": n} and simply absent when nothing has
+# shared the post.
+_PAGE_POST_BASE_FIELDS = (
+    "id,message,created_time,permalink_url,full_picture,status_type,"
+    "attachments{media_type,type},shares"
+)
+
+# Like and comment counts are *user-generated* content and need
+# `pages_read_user_content` on top. Verified against the live API on
+# 2026-07-29: with only pages_read_engagement, asking for these returns
+# error #10 and — because one bad field fails the entire request — takes every
+# post down with it. Requested as summaries with limit(0) so Meta sends the
+# totals without the underlying lists, which on a popular post would be
+# thousands of objects we immediately discard.
+_PAGE_POST_ENGAGEMENT_FIELDS = (
+    "likes.summary(true).limit(0),comments.summary(true).limit(0)"
+)
+
+
+async def get_page_posts(
+    page_id: str,
+    page_access_token: str,
+    limit: int = 50,
+    after: str | None = None,
+    include_engagement: bool = True,
+) -> dict[str, Any]:
+    """One page of the Page's own published posts, newest first.
+
+    ``published_posts`` rather than ``feed``: feed also carries posts other
+    people made to the Page, which are not this business's content and would
+    pollute every insight computed over them. (``feed`` also needs a permission
+    ``published_posts`` does not — it is the wrong edge twice over.)
+
+    ``include_engagement=False`` drops the like and comment counts, which is
+    what a Page without ``pages_read_user_content`` has to do. Whether to
+    degrade is the caller's decision, not this module's — retrying here would
+    repeat the rejected request once per page of results.
+
+    Returns the raw envelope so the caller can follow ``paging.cursors.after``,
+    matching ``get_instagram_media``.
+    """
+    fields = _PAGE_POST_BASE_FIELDS
+    if include_engagement:
+        fields = f"{fields},{_PAGE_POST_ENGAGEMENT_FIELDS}"
+
+    params: dict[str, Any] = {
+        "fields": fields,
+        "limit": limit,
+        "access_token": page_access_token,
+        "appsecret_proof": appsecret_proof(page_access_token),
+    }
+    if after:
+        params["after"] = after
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        return await _request(client, f"{page_id}/published_posts", params)
+
+
+# Page post insights, verified name by name against the live API on
+# 2026-07-29 (Graph v22.0). As with media insights, one unsupported metric
+# fails the *entire* call, so this list is exactly what was confirmed valid.
+#
+# There is deliberately no reach or impressions metric here. Every candidate —
+# post_impressions, post_impressions_unique/_organic/_paid, post_engaged_users,
+# post_views, views, reach, post_reach, post_content_views — returns error
+# #100 "must be a valid insights metric", which is a schema rejection rather
+# than a permission problem. Meta removed post-level reach for Pages in the
+# 2025 metric consolidation. Consequence: Facebook posts have no denominator,
+# so engagement_rate stays null for them and they must be compared on absolute
+# interactions instead. See build_facebook_snapshot_values.
+_PAGE_POST_METRICS = (
+    "post_clicks",
+    "post_reactions_by_type_total",
+    "post_reactions_like_total",
+    # Gives {"like": n, "comment": n, "share": n} — the only route to comment
+    # and share counts when pages_read_user_content was not granted.
+    "post_activity_by_action_type",
+    "post_video_views",
+)
+
+
+async def get_page_post_insights(
+    post_id: str, page_access_token: str
+) -> dict[str, Any]:
+    """Flatten a Page post's insights into ``{metric: value}``.
+
+    Unlike ``get_media_insights`` the values are not all integers —
+    ``post_reactions_by_type_total`` comes back as a per-reaction mapping such
+    as ``{"like": 12, "love": 3}``. Both shapes are passed through untouched;
+    deciding what a reaction breakdown *means* is the ingestion layer's job,
+    not this module's.
+
+    Returns ``{}`` rather than raising when Meta refuses the call. Page post
+    metrics are the part of this integration most likely to shift under us, and
+    the post's own like/comment/share counts come from the post object, so a
+    failure here costs reach and impressions rather than the whole row.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            payload = await _request(
+                client,
+                f"{post_id}/insights",
+                {
+                    "metric": ",".join(_PAGE_POST_METRICS),
+                    "access_token": page_access_token,
+                    "appsecret_proof": appsecret_proof(page_access_token),
+                },
+            )
+    except MetaAPIError as exc:
+        logger.warning("Insights unavailable for Page post %s: %s", post_id, exc)
+        return {}
+
+    values: dict[str, Any] = {}
+    for entry in payload.get("data", []):
+        name = entry.get("name")
+        series = entry.get("values") or []
+        if name and series:
+            values[name] = series[0].get("value")
     return values
 
 
